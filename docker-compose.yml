@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  db:
+    image: mysql:5.7
+    container_name: aarna-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: aarna
+      MYSQL_USER: aarnauser
+      MYSQL_PASSWORD: aarnapass
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./mysql-init:/docker-entrypoint-initdb.d
