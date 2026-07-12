@@ -57,7 +57,7 @@ foreach ($privilegedUsers as $p) {
     if (strcasecmp($currUser, $p) === 0) { $isPrivileged = true; break; }
 }
 
-// DJ Charges pricing table
+// DJ Charges pricing table (shown as a reference next to each type in the dropdown)
 $djChargesPrices = [
     'Basic' => 7500,
     'Extra base' => 11000,
@@ -237,21 +237,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['update_dj_prices']))
     $save = [];
     foreach ($fields as $key => $label) {
         $rows = [];
-        
-        // Special handling for DJ charges - needs both type and employee
+
         if ($key === 'dj_charges') {
+            // Type + employee dropdowns, but the amount is always whatever the user typed
+            // (no auto-fill from the pricing table).
             $empArr = isset($postedEmployees[$key]) && is_array($postedEmployees[$key]) ? $postedEmployees[$key] : [];
+            $amtArr = isset($postedAmounts[$key]) && is_array($postedAmounts[$key]) ? $postedAmounts[$key] : [];
             $typeArr = isset($postedDJTypes) && is_array($postedDJTypes) ? array_values($postedDJTypes) : [];
-            
-            $count = max(count($empArr), count($typeArr), 1);
+
+            $count = max(count($empArr), count($amtArr), count($typeArr), 1);
             for ($i = 0; $i < $count; $i++) {
                 $djType = isset($typeArr[$i]) && $typeArr[$i] !== '' ? htmlspecialchars($typeArr[$i]) : null;
                 $emp = isset($empArr[$i]) && $empArr[$i] !== '' ? htmlspecialchars($empArr[$i]) : null;
-                
-                if ($djType && isset($djChargesPrices[$djType])) {
-                    $amtVal = $djChargesPrices[$djType];
-                    $rows[] = ['dj_type' => $djType, 'employee' => $emp, 'amount' => $amtVal];
-                }
+                $amtVal = isset($amtArr[$i]) && $amtArr[$i] !== '' ? floatval(str_replace(',', '', $amtArr[$i])) : 0;
+                // skip rows with no positive amount
+                if ($amtVal <= 0) continue;
+                $rows[] = ['dj_type' => $djType, 'employee' => $emp, 'amount' => $amtVal];
             }
         } else {
             $empArr = isset($postedEmployees[$key]) && is_array($postedEmployees[$key]) ? $postedEmployees[$key] : [];
@@ -304,6 +305,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['update_dj_prices']))
     }
     $computedProfit = $decorAmt - $computedTotal;
     $save['profit'] = [['employee' => null, 'amount' => $computedProfit]];
+
+    // capture per-field notes (stored separately from the row data so it doesn't
+    // interfere with the normalized FunctionDetailLine insert loop below)
+    $postedNotes = isset($_POST['notes']) && is_array($_POST['notes']) ? $_POST['notes'] : [];
+    $fieldNotes = [];
+    foreach ($fields as $key => $label) {
+        if (isset($postedNotes[$key])) {
+            $noteVal = trim($postedNotes[$key]);
+            if ($noteVal !== '') $fieldNotes[$key] = $noteVal;
+        }
+    }
+    $save['__field_notes'] = $fieldNotes;
 
     // validate event date: do not allow save if event date is more than 2 days past
     $preventSave = false;
@@ -467,6 +480,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['update_dj_prices']))
                 $insNoEmp = mysqli_prepare($conn, "INSERT INTO FunctionDetailLine (eventID, field_key, employee_name, amount, saved_at) VALUES (?, ?, ?, ?, NOW())");
                 if ($insWithEmp || $insNoEmp) {
                     foreach ($save as $fieldKey => $rows) {
+                        if ($fieldKey === '__field_notes') continue;
                         if (!is_array($rows)) continue;
                         foreach ($rows as $r) {
                             $emp = isset($r['employee']) ? $r['employee'] : null;
@@ -548,16 +562,23 @@ if ($eventID > 0) {
     }
 }
 
+// pull saved per-field notes (if any) for display
+$fieldNotes = [];
+if (is_array($savedData) && isset($savedData['__field_notes']) && is_array($savedData['__field_notes'])) {
+    $fieldNotes = $savedData['__field_notes'];
+}
+
 // compute per-employee totals across all expense fields for the Incentives display
-// 10% of DJ charges added to the DJ employee
 $incentiveKeys = [
     'real_flower','banner','outside_labour_1','outside_labour_2','fixing','removal','aarna_labor',
-    'balloon','noble_bose','miscellaneous',
+    'balloon','noble_bose','dj_charges',
     'night_stay_person_1','night_stay_person_2','night_stay_electrician','watchman_stay',
     'wedding_pillars_person1','wedding_pillars_person2','wedding_pillars_person3','wedding_pillars_person4',
     'real_flower_purchase','real_flower_fixing_pillar',
     'WB','WC','GC','NM','B','LT'
 ];
+// NOTE: 'miscellaneous' is intentionally excluded from incentive calculation.
+// 'dj_charges' is now a normal amount field, counted in full against whichever employee is selected on that row.
 $incentivePerEmployee = []; // empID/name => total
 if (is_array($savedData)) {
     foreach ($incentiveKeys as $ik) {
@@ -578,27 +599,8 @@ if (is_array($savedData)) {
             $incentivePerEmployee[$empLabel] += $amt;
         }
     }
-    
-    // Add 10% of DJ Charges as incentive to the DJ employee
-    if (isset($savedData['dj_charges']) && is_array($savedData['dj_charges'])) {
-        foreach ($savedData['dj_charges'] as $r) {
-            if (!is_array($r)) continue;
-            $emp = isset($r['employee']) ? $r['employee'] : null;
-            $amt = isset($r['amount']) ? floatval($r['amount']) : 0;
-            if ($emp === null || $emp === '' || $amt <= 0) continue;
-            
-            $djIncentive = $amt * 0.10;
-            // resolve display name
-            $empLabel = $emp;
-            foreach ($employeeOptions as $eo) {
-                if ((string)$eo['id'] === (string)$emp || (string)$eo['name'] === (string)$emp) {
-                    $empLabel = $eo['name']; break;
-                }
-            }
-            if (!isset($incentivePerEmployee[$empLabel])) $incentivePerEmployee[$empLabel] = 0;
-            $incentivePerEmployee[$empLabel] += $djIncentive;
-        }
-    }
+    // NOTE: DJ Charges is included above in $incentiveKeys, so it's counted here too,
+    // attributed in full to whichever employee was selected on that row.
 }
 // keep only employees with total > 0
 $incentivePerEmployee = array_filter($incentivePerEmployee, function($v){ return $v > 0; });
@@ -663,6 +665,15 @@ button[type=button].cancel { background:#6b7280; }
 /* DJ row wrapper */
 .dj-row-wrapper { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
 .dj-row-wrapper .select { flex: 1; min-width: 180px; }
+
+/* Field notes */
+.notes-icon-btn { background:none; border:none; cursor:pointer; font-size:.95rem; margin-left:6px; padding:0 2px; vertical-align:middle; opacity:0.75; }
+.notes-icon-btn:hover { opacity:1; }
+.notes-block { margin-top:4px; }
+.notes-display { display:none; font-style:italic; color:#666; font-size:.85rem; white-space:pre-wrap; cursor:default; }
+.notes-display.has-note { display:block; }
+.notes-textarea { display:none; width:100%; max-width:360px; min-height:50px; margin-top:4px; padding:6px 8px; border:1px solid #d5dce6; border-radius:6px; font-size:.85rem; font-family:inherit; resize:vertical; }
+.notes-textarea.editing { display:block; }
 
 @media (max-width: 760px) {
     .row-entry { flex-direction:column; align-items:stretch; }
@@ -742,7 +753,15 @@ button[type=button].cancel { background:#6b7280; }
 ?>
 <tr>
     <td style="vertical-align:top; width:260px;">
-        <label><?php echo htmlspecialchars($label); ?><?php if ($key === 'dj_charges' && $isPrivileged): ?> <button type="button" class="dj-edit-btn" onclick="openDJModal()">⚙ Edit Pricing</button><?php endif; ?></label>
+        <?php $noteVal = isset($fieldNotes[$key]) ? $fieldNotes[$key] : ''; ?>
+        <label><?php echo htmlspecialchars($label); ?><?php if ($key === 'dj_charges' && $isPrivileged): ?> <button type="button" class="dj-edit-btn" onclick="openDJModal()">⚙ Edit Pricing</button><?php endif; ?>
+            <button type="button" class="notes-icon-btn" title="Add/Edit note" onclick="toggleNoteEdit('<?php echo $key; ?>')">📝</button>
+        </label>
+        <div class="notes-block">
+            <span class="notes-display<?php echo $noteVal !== '' ? ' has-note' : ''; ?>" id="notes-display-<?php echo $key; ?>"><?php echo htmlspecialchars($noteVal); ?></span>
+            <textarea class="notes-textarea" id="notes-textarea-<?php echo $key; ?>" placeholder="Add a note..." onblur="saveNoteEdit('<?php echo $key; ?>')"><?php echo htmlspecialchars($noteVal); ?></textarea>
+            <input type="hidden" name="notes[<?php echo $key; ?>]" id="notes-input-<?php echo $key; ?>" value="<?php echo htmlspecialchars($noteVal); ?>">
+        </div>
     </td>
     <td>
         <div class="rows-container" data-field="<?php echo htmlspecialchars($key); ?>">
@@ -799,9 +818,9 @@ button[type=button].cancel { background:#6b7280; }
                     </div>
                     <?php endif; ?>
                 <?php elseif ($key === 'dj_charges'): ?>
-                    <!-- DJ Charges: type dropdown + employee dropdown + readonly amount -->
+                    <!-- DJ Charges: type dropdown (reference only) + employee dropdown + manually-entered amount -->
                     <div class="dj-row-wrapper">
-                        <select name="dj_type_selector[<?php echo $idx; ?>]" class="select dj-type-select" onchange="updateDJAmount(this)">
+                        <select name="dj_type_selector[<?php echo $idx; ?>]" class="select dj-type-select">
                             <option value="">--type--</option>
                             <?php foreach ($djChargesPrices as $type => $price): ?>
                                 <option value="<?php echo htmlspecialchars($type); ?>" <?php echo ((string)(isset($entry['dj_type']) ? $entry['dj_type'] : '') === (string)$type) ? 'selected' : ''; ?>>
@@ -819,7 +838,7 @@ button[type=button].cancel { background:#6b7280; }
                             <option value="<?php echo htmlspecialchars($val); ?>" <?php echo $selEmp; ?>><?php echo htmlspecialchars($text); ?></option>
                             <?php endforeach; ?>
                         </select>
-                        <input class="amount dj-amount-display" type="text" name="amounts[<?php echo $key; ?>][]" value="<?php echo htmlspecialchars($entry['amount']); ?>" placeholder="Amount" readonly style="background:#f3f4f6;cursor:not-allowed;">
+                        <input class="amount dj-amount-display" type="text" name="amounts[<?php echo $key; ?>][]" value="<?php echo htmlspecialchars($entry['amount']); ?>" placeholder="Amount">
                         <button type="button" class="remove-row-btn" onclick="removeRow(this)">-</button>
                     </div>
                 <?php elseif (in_array($key, ['decor_amount','real_flower','real_flower_purchase','real_flower_fixing_pillar','banner','outside_labour_1','outside_labour_2'])): ?>
@@ -859,7 +878,7 @@ button[type=button].cancel { background:#6b7280; }
 </div>
 
 <script>
-// DJ Charges pricing map
+// DJ Charges pricing map (reference only — no longer used to auto-fill the amount)
 var djChargesPrices = <?php echo json_encode($djChargesPrices); ?>;
 
 function openDJModal() {
@@ -870,16 +889,37 @@ function closeDJModal() {
     document.getElementById('djModalOverlay').classList.remove('active');
 }
 
-// Update amount field when DJ Charges type is selected
-function updateDJAmount(select) {
-    var selectedType = select.value;
-    var amountField = select.closest('.dj-row-wrapper').querySelector('.dj-amount-display');
-    if (selectedType && djChargesPrices[selectedType]) {
-        amountField.value = djChargesPrices[selectedType];
+// ── Per-field notes: icon toggles edit mode; on save shows italic read-only text ──
+function toggleNoteEdit(key) {
+    var textarea = document.getElementById('notes-textarea-' + key);
+    var display = document.getElementById('notes-display-' + key);
+    if (!textarea) return;
+    if (textarea.classList.contains('editing')) {
+        saveNoteEdit(key);
     } else {
-        amountField.value = '';
+        textarea.classList.add('editing');
+        if (display) display.classList.remove('has-note');
+        textarea.focus();
     }
-    recomputeTotal();
+}
+
+function saveNoteEdit(key) {
+    var textarea = document.getElementById('notes-textarea-' + key);
+    var display = document.getElementById('notes-display-' + key);
+    var input = document.getElementById('notes-input-' + key);
+    if (!textarea) return;
+    var val = textarea.value.trim();
+    textarea.value = val;
+    if (input) input.value = val;
+    textarea.classList.remove('editing');
+    if (display) {
+        display.textContent = val;
+        if (val !== '') {
+            display.classList.add('has-note');
+        } else {
+            display.classList.remove('has-note');
+        }
+    }
 }
 
 // dynamic add/remove rows per field
@@ -919,13 +959,12 @@ window.addEventListener('DOMContentLoaded', function(){
             entry.appendChild(amt);
             entry.appendChild(rem);
         } else if (field === 'dj_charges') {
-            // DJ Charges: type dropdown + employee dropdown + readonly amount
+            // DJ Charges: type dropdown (reference only) + employee dropdown + manually-entered amount
             var wrapper = document.createElement('div');
             wrapper.className = 'dj-row-wrapper';
-            
+
             var typeSel = document.createElement('select');
             typeSel.className = 'select dj-type-select';
-            typeSel.onchange = function() { updateDJAmount(typeSel); };
             var typePh = document.createElement('option');
             typePh.value = ''; typePh.textContent = '--type--';
             typeSel.appendChild(typePh);
@@ -950,9 +989,9 @@ window.addEventListener('DOMContentLoaded', function(){
             });
 
             var amt = document.createElement('input');
-            amt.type = 'text'; amt.name = 'amounts[dj_charges][]'; amt.className = 'amount dj-amount-display'; amt.placeholder = 'Amount'; amt.readOnly = true; amt.style.background = '#f3f4f6'; amt.style.cursor = 'not-allowed';
-            
-            var rem = document.createElement('button'); 
+            amt.type = 'text'; amt.name = 'amounts[dj_charges][]'; amt.className = 'amount dj-amount-display'; amt.placeholder = 'Amount';
+
+            var rem = document.createElement('button');
             rem.type = 'button'; rem.className = 'remove-row-btn'; rem.textContent = '-'; rem.onclick = function(){ removeRow(rem); };
 
             wrapper.appendChild(typeSel);
